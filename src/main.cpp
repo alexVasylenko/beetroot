@@ -1,40 +1,104 @@
 #include <Arduino.h>
 
-constexpr uint8_t PIN_LED_RED   = 4;
-constexpr uint8_t PIN_LED_GREEN = 5;
-constexpr uint8_t PIN_LED_BLUE  = 6;
+constexpr UBaseType_t PRIO_LOW      = 1;
+constexpr UBaseType_t PRIO_NORMAL   = 2;
+constexpr UBaseType_t PRIO_HIGH     = 3;
+constexpr UBaseType_t PRIO_REALTIME = 4;
 
-struct Led {
-  uint8_t  pin;
-  uint32_t periodMs;
-};
+constexpr BaseType_t APP_CORE = 1;
 
-Led leds[] = {
-  { PIN_LED_RED,   200 },
-  { PIN_LED_BLUE,  500 },
-  { PIN_LED_GREEN, 1000 },
-};
+constexpr uint32_t SENSOR_PERIOD_MS = 500;
+constexpr uint32_t EVENT_PERIOD_MS  = 3000;
+constexpr uint32_t MAINT_PERIOD_MS  = 10000;
+constexpr uint32_t MAINT_PAUSE_MS   = 2000;
 
-void ledTask(void *pv) {
-    Led *led = static_cast<Led *>(pv);
-    pinMode(led->pin, OUTPUT);
+constexpr uint32_t STACK_BYTES = 3072;
 
-    TickType_t last = xTaskGetTickCount();
-    bool isOn = false;
-    for (;;) {
-        isOn = !isOn;
-        digitalWrite(led->pin, isOn);
-        vTaskDelayUntil(&last, pdMS_TO_TICKS(led->periodMs));
-    }
+TaskHandle_t sensorHandle = nullptr;
+uint32_t     workerCounter = 0;
+
+static void logLine(const char *msg) {
+  Serial.printf("[%7lu ms] %s\n", (unsigned long)millis(), msg);
 }
 
-// ============================ SUPERLOOP ============================
-void setup() {
-  for (Led& l : leds) {
-    xTaskCreate(ledTask, "led", 2048, const_cast<Led*>(&l), 1, nullptr);
+static void sensorTask(void *pv) {
+  (void)pv;
+
+  TickType_t lastWake = xTaskGetTickCount();
+
+  for (;;) {
+    logLine("[Sensor] Data read...");
+
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(SENSOR_PERIOD_MS));
   }
 }
 
-void loop() {
+static void workerTask(void *pv) {
+  (void)pv;
 
+  logLine("[Worker] Processing event...");
+
+  vTaskDelete(NULL);
+}
+
+static void eventTriggerTask(void *pv) {
+  (void)pv;
+
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(EVENT_PERIOD_MS));
+
+    char name[configMAX_TASK_NAME_LEN];
+    Serial.print(name);
+
+    char msg[96];
+    Serial.print("[Event] Створюю ");
+    Serial.print(name);
+    logLine(msg);
+
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        workerTask, name, STACK_BYTES, nullptr, PRIO_HIGH, nullptr, APP_CORE);
+
+    if (ok != pdPASS) {
+      logLine("[Event] ПОМИЛКА: не вдалося створити задачу (мало памʼяті)");
+    }
+  }
+}
+
+static void maintenanceTask(void *pv) {
+  (void)pv;
+
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(MAINT_PERIOD_MS));
+
+    vTaskSuspend(sensorHandle);
+    logLine("[Maintenance] System paused for 2 seconds.");
+
+    vTaskDelay(pdMS_TO_TICKS(MAINT_PAUSE_MS));
+
+    vTaskResume(sensorHandle);
+    logLine("[Maintenance] Sensor resumed");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  Serial.println();
+  Serial.println("=== Завдання 6.2: чотири задачі FreeRTOS ===");
+  Serial.printf("Ядро %d, tick = %u Гц, макс. пріоритет = %d\n",
+                (int)APP_CORE, (unsigned)configTICK_RATE_HZ,
+                (int)configMAX_PRIORITIES - 1);
+  Serial.println();
+
+  xTaskCreatePinnedToCore(sensorTask, "sensor", STACK_BYTES, nullptr,
+                          PRIO_NORMAL, &sensorHandle, APP_CORE);
+
+  xTaskCreatePinnedToCore(eventTriggerTask, "event", STACK_BYTES, nullptr,
+                          PRIO_LOW, nullptr, APP_CORE);
+
+  xTaskCreatePinnedToCore(maintenanceTask, "maint", STACK_BYTES, nullptr,
+                          PRIO_REALTIME, nullptr, APP_CORE);
+}
+
+void loop() {
 }
