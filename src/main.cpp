@@ -1,104 +1,162 @@
 #include <Arduino.h>
 
-constexpr UBaseType_t PRIO_LOW      = 1;
-constexpr UBaseType_t PRIO_NORMAL   = 2;
-constexpr UBaseType_t PRIO_HIGH     = 3;
-constexpr UBaseType_t PRIO_REALTIME = 4;
+constexpr uint8_t PIN_SENSOR = 16;
+constexpr uint8_t PIN_STOP   = 0;
+constexpr uint8_t PIN_ALARM  = 6;
+constexpr uint8_t PIN_ADC    = 4;
 
-constexpr BaseType_t APP_CORE = 1;
+constexpr UBaseType_t PRIO_REPORT    = 2;
+constexpr UBaseType_t PRIO_ADC       = 2;
+constexpr UBaseType_t PRIO_EMERGENCY = 5;
 
-constexpr uint32_t SENSOR_PERIOD_MS = 500;
-constexpr uint32_t EVENT_PERIOD_MS  = 3000;
-constexpr uint32_t MAINT_PERIOD_MS  = 10000;
-constexpr uint32_t MAINT_PAUSE_MS   = 2000;
+constexpr BaseType_t CORE_0 = 0;
+constexpr BaseType_t CORE_1 = 1;
 
-constexpr uint32_t STACK_BYTES = 3072;
+constexpr uint32_t PERIOD_MS   = 1000;
+constexpr uint32_t DEBOUNCE_MS = 50;
+constexpr size_t   REPORT_SIZE = 192;
+constexpr uint32_t STACK_BYTES = 4096;
 
-TaskHandle_t sensorHandle = nullptr;
-uint32_t     workerCounter = 0;
+static volatile uint32_t partsCount = 0;
+static portMUX_TYPE counterMux = portMUX_INITIALIZER_UNLOCKED;
 
-static void logLine(const char *msg) {
-  Serial.printf("[%7lu ms] %s\n", (unsigned long)millis(), msg);
+static char reportBuffer[REPORT_SIZE];
+static SemaphoreHandle_t reportMutex = nullptr;
+
+static volatile bool systemHalted = false;
+
+static TaskHandle_t hReport    = nullptr;
+static TaskHandle_t hAdc       = nullptr;
+static TaskHandle_t hEmergency = nullptr;
+
+void IRAM_ATTR sensorIsr() {
+  static uint32_t lastMs = 0;
+  const uint32_t now = millis();
+  if (now - lastMs < DEBOUNCE_MS) return;
+  lastMs = now;
+
+  portENTER_CRITICAL_ISR(&counterMux);
+  partsCount++;
+  portEXIT_CRITICAL_ISR(&counterMux);
 }
 
-static void sensorTask(void *pv) {
-  (void)pv;
+void IRAM_ATTR stopIsr() {
+  static uint32_t lastMs = 0;
+  const uint32_t now = millis();
+  if (now - lastMs < DEBOUNCE_MS) return;
+  lastMs = now;
 
+  BaseType_t higherPriorityTaskWoken = pdFALSE;
+  vTaskNotifyGiveFromISR(hEmergency, &higherPriorityTaskWoken);
+
+  if (higherPriorityTaskWoken) portYIELD_FROM_ISR();
+}
+
+static void reportTask(void *pv) {
+  (void)pv;
   TickType_t lastWake = xTaskGetTickCount();
+  uint32_t prevCount = 0;
 
   for (;;) {
-    logLine("[Sensor] Data read...");
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(PERIOD_MS));
+    if (systemHalted) continue;
 
-    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(SENSOR_PERIOD_MS));
-  }
-}
+    uint32_t count;
+    portENTER_CRITICAL(&counterMux);
+    count = partsCount;
+    portEXIT_CRITICAL(&counterMux);
 
-static void workerTask(void *pv) {
-  (void)pv;
+    const uint32_t perMinute = (count - prevCount) * (60000 / PERIOD_MS);
+    prevCount = count;
 
-  logLine("[Worker] Processing event...");
-
-  vTaskDelete(NULL);
-}
-
-static void eventTriggerTask(void *pv) {
-  (void)pv;
-
-  for (;;) {
-    vTaskDelay(pdMS_TO_TICKS(EVENT_PERIOD_MS));
-
-    char name[configMAX_TASK_NAME_LEN];
-    Serial.print(name);
-
-    char msg[96];
-    Serial.print("[Event] Створюю ");
-    Serial.print(name);
-    logLine(msg);
-
-    BaseType_t ok = xTaskCreatePinnedToCore(
-        workerTask, name, STACK_BYTES, nullptr, PRIO_HIGH, nullptr, APP_CORE);
-
-    if (ok != pdPASS) {
-      logLine("[Event] ПОМИЛКА: не вдалося створити задачу (мало памʼяті)");
+    if (xSemaphoreTake(reportMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      snprintf(reportBuffer, REPORT_SIZE,
+               "[%6lu ms] деталей: %-5lu швидкість: %-4lu дет/хв",
+               (unsigned long)millis(), (unsigned long)count,
+               (unsigned long)perMinute);
+      xSemaphoreGive(reportMutex);
+      xTaskNotifyGive(hAdc);
+    } else {
+      Serial.println("[Report] мʼютекс зайнятий довше 100 мс");
     }
   }
 }
 
-static void maintenanceTask(void *pv) {
+// --------------------- Task 2: АЦП, ядро 1 -------------------------------
+static void adcTask(void *pv) {
   (void)pv;
 
   for (;;) {
-    vTaskDelay(pdMS_TO_TICKS(MAINT_PERIOD_MS));
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    if (systemHalted) continue;
 
-    vTaskSuspend(sensorHandle);
-    logLine("[Maintenance] System paused for 2 seconds.");
+    const uint16_t mv = analogReadMilliVolts(PIN_ADC);
 
-    vTaskDelay(pdMS_TO_TICKS(MAINT_PAUSE_MS));
+    if (xSemaphoreTake(reportMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      const size_t len = strlen(reportBuffer);
+      snprintf(reportBuffer + len, REPORT_SIZE - len, " | АЦП: %u мВ", mv);
+      Serial.println(reportBuffer);        // рядок повний — друкуємо
+      xSemaphoreGive(reportMutex);
+    } else {
+      Serial.println("[ADC] мʼютекс зайнятий довше 100 мс");
+    }
+  }
+}
 
-    vTaskResume(sensorHandle);
-    logLine("[Maintenance] Sensor resumed");
+static void emergencyTask(void *pv) {
+  (void)pv;
+
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    digitalWrite(PIN_ALARM, HIGH);
+    systemHalted = true;
+
+    detachInterrupt(digitalPinToInterrupt(PIN_SENSOR));
+
+    if (xSemaphoreTake(reportMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      snprintf(reportBuffer, REPORT_SIZE, "*** SYSTEM HALTED! ***");
+      Serial.println(reportBuffer);
+      xSemaphoreGive(reportMutex);
+    } else {
+      Serial.println("*** SYSTEM HALTED! (буфер був зайнятий) ***");
+    }
   }
 }
 
 void setup() {
   Serial.begin(115200);
+  delay(300);
+
+  pinMode(PIN_ALARM, OUTPUT);
+  digitalWrite(PIN_ALARM, LOW);
+  pinMode(PIN_SENSOR, INPUT_PULLUP);
+  pinMode(PIN_STOP, INPUT);          
+  analogReadResolution(12);
 
   Serial.println();
-  Serial.println("=== Завдання 6.2: чотири задачі FreeRTOS ===");
-  Serial.printf("Ядро %d, tick = %u Гц, макс. пріоритет = %d\n",
-                (int)APP_CORE, (unsigned)configTICK_RATE_HZ,
-                (int)configMAX_PRIORITIES - 1);
-  Serial.println();
+  Serial.println("GPIO16 — деталь | BOOT — аварійна зупинка");
 
-  xTaskCreatePinnedToCore(sensorTask, "sensor", STACK_BYTES, nullptr,
-                          PRIO_NORMAL, &sensorHandle, APP_CORE);
+  reportMutex = xSemaphoreCreateMutex();
+  if (reportMutex == nullptr) {
+    Serial.println("ПОМИЛКА: не вдалося створити мʼютекс");
+    return;
+  }
 
-  xTaskCreatePinnedToCore(eventTriggerTask, "event", STACK_BYTES, nullptr,
-                          PRIO_LOW, nullptr, APP_CORE);
+  xTaskCreatePinnedToCore(reportTask, "report", STACK_BYTES, nullptr,
+                          PRIO_REPORT, &hReport, CORE_0);
+  xTaskCreatePinnedToCore(adcTask, "adc", STACK_BYTES, nullptr,
+                          PRIO_ADC, &hAdc, CORE_1);
+  xTaskCreatePinnedToCore(emergencyTask, "emergency", STACK_BYTES, nullptr,
+                          PRIO_EMERGENCY, &hEmergency, CORE_1);
 
-  xTaskCreatePinnedToCore(maintenanceTask, "maint", STACK_BYTES, nullptr,
-                          PRIO_REALTIME, nullptr, APP_CORE);
+  if (hReport == nullptr || hAdc == nullptr || hEmergency == nullptr) {
+    Serial.println("ПОМИЛКА: не вдалося створити задачі");
+    return;
+  }
+
+  attachInterrupt(digitalPinToInterrupt(PIN_SENSOR), sensorIsr, FALLING);
+  attachInterrupt(digitalPinToInterrupt(PIN_STOP), stopIsr, FALLING);
 }
 
-void loop() {
-}
+void loop() {}
